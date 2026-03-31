@@ -1,0 +1,1544 @@
+---
+title: "Code for CALERIE manuscript"
+author: "Akshay Bareja"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggfortify)
+library(biomaRt)
+library(limma)
+library(edgeR)
+library(DT)
+library(fgsea)
+library(patchwork)
+library(GSVA)
+library(pheatmap)
+library(pathview)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(openxlsx)
+library(ggpmisc)
+library(car)
+```
+
+This document contains code for the manuscript "Biological Mechanisms of Strength Preservation During Calorie Restriction-Induced Weight Loss Among Young- to Middle-Aged Adults without Obesity"
+
+## Check renv status
+
+```{r}
+renv::status()
+```
+
+## strength ~ mass code
+
+```{r warning = FALSE, message = FALSE}
+# Import and clean data
+sex_info <- read_csv("Regression Analysis Data/data/IVRSRAND.CSV") %>%   
+              dplyr::select(deidnum, strata)
+strength_data <- read_csv("Regression Analysis Data/data/ISOMETRA.CSV") %>% dplyr::select(deidnum, visit, ke60ptm) %>% 
+              dplyr::mutate(across(where(is.character), ~ str_trim(tolower(.)))) %>%               dplyr::mutate(ke60ptm = as.numeric(ke60ptm))
+mass_data <- read_csv("Regression Analysis Data/data/DXAA.CSV") %>% 
+                  dplyr::select(deidnum, visit, BTOTMASS) %>% 
+                  dplyr::mutate(across(where(is.character), ~ str_trim(tolower(.)))) %>% 
+                  dplyr::mutate(BTOTMASS = as.numeric(BTOTMASS))
+
+# Extract sex from 'strata' column and keep only unique `deidnum`
+sex_info <- sex_info %>%
+  dplyr::mutate(sex = if_else(str_detect(strata, 'Male'), 'Male', 'Female')) %>%
+  dplyr::select(deidnum, sex) %>%
+  dplyr::distinct(deidnum, .keep_all = TRUE)
+
+# Filter for Baseline and Month 12 visits
+baseline <- strength_data %>%
+  dplyr::filter(visit == "bl sub 2") %>%
+  dplyr::inner_join(dplyr::filter(mass_data, visit == "bl sub 2"), by = c('deidnum', 'visit')) 
+
+month12 <- strength_data %>%
+  dplyr::filter(visit == "month 12") %>%
+  dplyr::inner_join(dplyr::filter(mass_data, visit == "month 12"), by = c('deidnum', 'visit')) 
+
+# Rename columns for consistency
+baseline <- baseline %>%
+  dplyr::rename(strength_baseline = ke60ptm, mass_baseline = BTOTMASS)
+month12 <- month12 %>%
+  dplyr::rename(strength_12m = ke60ptm, mass_12m = BTOTMASS)
+
+# Merge Baseline and Month 12 data
+df <- baseline %>%
+  dplyr::select(deidnum, strength_baseline, mass_baseline) %>%
+  dplyr::inner_join(dplyr::select(month12, deidnum, strength_12m, mass_12m), 
+                    join_by(deidnum))
+
+# Merge sex info
+df <- df %>%
+  dplyr::left_join(sex_info, by = 'deidnum')
+
+# Compute deltas and % changes
+df <- df %>%
+  dplyr::mutate(
+    `∆ Strength` = strength_12m - strength_baseline,
+    `% Strength` = (`∆ Strength` / strength_baseline) * 100,
+    `∆ Mass` = mass_12m - mass_baseline,
+    `% Mass` = (`∆ Mass` / mass_baseline) * 100
+  )
+
+# Remove unnecessary columns
+df <- df %>%
+  dplyr::select(deidnum, strength_baseline, strength_12m, mass_baseline, mass_12m,
+         `∆ Strength`, `% Strength`, `∆ Mass`, `% Mass`, sex)
+
+# Drop NAs for clean regression analysis
+df <- df %>%
+  tidyr::drop_na(`% Strength`, `% Mass`, `∆ Strength`, `∆ Mass`)
+
+# Run regression
+strength_v_mass_lm <- lm(`% Strength` ~ `% Mass`, data = df)
+summary(strength_v_mass_lm)
+
+# regression diagnostics plots
+#autoplot(strength_v_mass_lm)
+
+# R-squared
+summary(strength_v_mass_lm)$r.squared
+
+residuals_strength_v_mass <- residuals(strength_v_mass_lm) %>% 
+  tibble::enframe(
+    name = "deidnum", # just a placeholder here!
+    value = "residuals"
+  ) %>% 
+  dplyr::mutate(deidnum = df$deidnum)
+
+residuals_strength_v_mass %>% 
+  dplyr::count(residuals >= 0)
+# `residuals >= 0`     n
+#   <lgl>            <int>
+# 1 FALSE               102
+# 2 TRUE                96
+
+# save df used for regression
+#write_csv(df, "results/df_for_lm_AB_012626.csv")
+```
+
+## RNAseq analysis code
+
+### Import and clean data
+
+```{r warning = FALSE, message = FALSE}
+counts <- read_csv("Regression Analysis Data/counts_hg38.csv") %>% 
+            dplyr::rename(ensembl_gene_id = `...1`) %>% 
+            dplyr::rename_with(.cols = -ensembl_gene_id,
+                               .fn = ~str_extract(.x, "(?<=\\_).+(?=\\_sorted)")) %>%  # clean up column names
+            dplyr::rename_with(.cols = contains("month"),
+                               .fn = ~str_replace(.x, "\\_month", "month")) %>% # remove underscore before each occurrence of "month"
+            dplyr::rename_with(.cols = everything(),
+                               .fn = ~str_replace(.x, "\\_$", "")) # needed because some sample have two underscores after the timepoint
+
+# reshape and clean counts df
+counts_long <- counts %>% 
+  tidyr::pivot_longer(cols = -ensembl_gene_id,
+                      names_to = "sample",
+                      values_to = "count") %>% 
+  dplyr::filter(!str_detect(sample, "24month")) %>% 
+  tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+  dplyr::filter(deidnum %in% residuals_strength_v_mass$deidnum) # only keep samples that are also in residual dfs
+
+# do all subjects have two timepoints?
+pairs_vec <- counts_long %>%
+  dplyr::filter(ensembl_gene_id == "ENSG00000284662") %>% # picking a random gene
+  dplyr::count(deidnum) %>%
+  dplyr::filter(n == 2) %>%
+  dplyr::pull(deidnum) # pairs
+# no
+# Only 42 individuals have data at both time-points
+
+# only keep samples with counts for both timepoints (Baseline and 12M)
+counts_long <- counts_long %>% 
+                dplyr::filter(deidnum %in% pairs_vec)
+
+# check if all pairs
+# counts_long %>%
+#   dplyr::filter(ensembl_gene_id == "ENSG00000284662") %>%
+#   dplyr::count(deidnum) %>%
+#   dplyr::filter(n != 2)
+# yes
+
+# look up gene symbols for Ensembl gene ids
+# mart <- useEnsembl(biomart = "ensembl", 
+#                    dataset = "hsapiens_gene_ensembl")
+# 
+# genes_df <- getBM(filters = "ensembl_gene_id",
+#                   attributes = c("ensembl_gene_id", "external_gene_name"),
+#                   values = counts$ensembl_gene_id, 
+#                   mart = mart)
+# Note - this is Ensembl v114
+
+# save this df
+#write_csv(genes_df, "metadata/genes_df_081925.csv") #v114
+
+# import genes_df
+genes_df <- read_csv("metadata/genes_df_081925.csv")
+
+# look up gene symbols for Ensembl gene ids for Ensembl v104
+# version used in Das 2023 (https://onlinelibrary.wiley.com/doi/10.1111/acel.13963)
+# mart <- useEnsembl(biomart = "ensembl",
+#                    dataset = "hsapiens_gene_ensembl",
+#                    version = 104)
+# 
+# genes_df_v104 <- getBM(filters = "ensembl_gene_id",
+#                   attributes = c("ensembl_gene_id", "external_gene_name"),
+#                   values = counts$ensembl_gene_id,
+#                   mart = mart)
+# decision - use more recent annotation
+
+# are there repeats?
+# genes_df %>%
+#   dplyr::count(external_gene_name) %>%
+#   dplyr::arrange(desc(n)) # yes!
+# genes_df %>%
+#   dplyr::count(ensembl_gene_id) %>%
+#   dplyr::arrange(desc(n)) # all unique
+
+# remove genes that have 0 counts in >50% of samples
+# for each subgroup i.e. baseline or 12M
+# (following approach described in https://onlinelibrary.wiley.com/doi/10.1111/acel.13963)
+counts_filt_df <- counts_long %>% 
+  tidyr::unite(col = "sample", deidnum:timepoint, sep = "_") %>% 
+  tidyr::pivot_wider(
+    names_from = sample,
+    values_from = count
+  ) %>% 
+  dplyr::rowwise() %>% 
+  dplyr::mutate(zero_sums_base = sum(c_across(contains("Baseline")) == 0),
+                num_samples_base = (ncol(.) - 1)/2,
+                zero_frac_base = zero_sums_base/num_samples_base,
+                zero_sums_12m = sum(c_across(contains("12month")) == 0),
+                num_samples_12m = (ncol(.) - 1)/2,
+                zero_frac_12m = zero_sums_12m/num_samples_12m) %>% 
+  dplyr::filter(if_all(
+    .cols = contains("frac"),
+    .fns = ~.x < 0.5 # only keep genes with <50% 0 counts for BOTH timepoints
+  )) %>% 
+  dplyr::select(-c(matches("(_base|_12m)$"))) %>% 
+  dplyr::ungroup()
+
+# normalize counts by TMM
+counts_mat <- as.matrix(counts_filt_df[ , -1])
+rownames(counts_mat) <- counts_filt_df$ensembl_gene_id
+
+## as DGEList
+dge <- edgeR::DGEList(counts = counts_mat)
+
+## calculate norm. factors
+dge <- edgeR::calcNormFactors(dge,
+                       method = "TMM")
+
+## get normalized counts
+counts_log_cpm <- dplyr::bind_cols(counts_filt_df[ , 1],
+                                   edgeR::cpm(dge,
+                                              log = TRUE))
+
+# % of positive and negative residual individuals ALSO present in the counts dataframe
+counts_log_cpm %>% 
+    dplyr::filter(ensembl_gene_id == "ENSG00000005206") %>%
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(residuals_strength_v_mass, 
+                      join_by(deidnum)) %>% 
+    dplyr::count(residuals >= 0)
+# `residuals >= 0`     n
+#   <lgl>            <int>
+# 1 FALSE               20
+# 2 TRUE                22
+
+# save this
+#write_csv(counts_log_cpm, "results/counts_log_cpm_AB_012626.csv")
+```
+
+### Fit gene expression linear models
+
+```{r warning = FALSE, message = FALSE, include = FALSE}
+# test on one gene
+test_df <- counts_log_cpm %>% 
+    dplyr::filter(ensembl_gene_id == "ENSG00000080824") %>% # HSP90AA1
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(df, join_by(deidnum)) %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% # only keep gene IDs with corresponding gene symbols
+    dplyr::filter(external_gene_name != "") 
+
+# apply(test_df, 2, function(x) sum(is.na(x)))
+# no missing values
+
+test_lm <- lm(`% Strength` ~ delta_norm_counts + `% Mass`, data = test_df)
+summary(test_lm)
+
+# alternatively
+test_lm_ancova <- lm(strength_12m ~ `12month` + strength_baseline + mass_12m + mass_baseline + Baseline, data = test_df)
+summary(test_lm_ancova)
+
+plot(test_lm)
+plot(test_lm_ancova)
+
+# pull out coefficients
+summary(test_lm)$coefficients[ , 1][[2]]
+summary(test_lm_ancova)$coefficients[ , 1][[2]]
+```
+
+
+```{r warning = FALSE, message = FALSE}
+# specify model formula
+formula <- reformulate(c("delta_norm_counts", "`% Mass`"), response = "`% Strength`")
+
+# function for fitting linear models
+# strength_data - data frame with strength and additional covariate data (e.g. mass, FFM...)
+# counts_df - normalized gene expression dataframe 
+# model_formula - model formula for lm()
+fit_lm_counts_multi <- function(strength_data, counts_df, model_formula){
+  
+  # compute delta normalized counts
+  lm_df <- counts_df %>% 
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(strength_data, join_by(deidnum)) %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% # only keep gene IDs with corresponding gene symbols
+    dplyr::filter(external_gene_name != "") %>% 
+    dplyr::nest_by(ensembl_gene_id)
+  
+  # fit linear model for all genes
+  models_df <- lm_df %>% 
+    dplyr::mutate(mod = list(lm(model_formula, data = data)))
+  
+  # pull out results
+  results_model_df <- models_df %>% 
+    summarise(beta = summary(mod)$coefficients[ , 1][[2]], # pull out coefficient corresponding to delta_norm_counts
+              std_error = summary(mod)$coefficients[ , 2][[2]],
+              t_stat = summary(mod)$coefficients[ , 3][[2]],
+              p_val = summary(mod)$coefficients[ , 4][[2]]) %>% 
+                      dplyr::ungroup()
+  
+  # add BH-corrected p-values
+  results_model_df$BH_p_val <- p.adjust(results_model_df$p_val,
+                                        method = "BH")
+  
+  return(results_model_df)
+  
+}
+
+results_gene_mass <- fit_lm_counts_multi(strength_data = df,
+                                         counts_df = counts_log_cpm,
+                                         model_formula = formula)
+
+# present results
+results_gene_mass %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % Mass")
+
+# number of results with p < 0.01
+results_gene_mass %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 151
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 10)
+
+# save results
+# write_csv(results_gene_mass, "results/results_gene_mass_AB_012626.csv")
+```
+
+### GSEA
+
+```{r warning = FALSE, message = FALSE}
+# gmt files downloaded from -
+# https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/
+
+# write function for running fgsea
+gsea_fun <- function(lm_results_df, ranking_metric, gene_set){
+  
+  if(ranking_metric == "t-stat"){
+    
+    # ranking metric - average t-stat for each gene symbol
+    ranks <- lm_results_df %>% 
+      dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+      dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+      dplyr::group_by(external_gene_name) %>% 
+      dplyr::summarise(mean_t = mean(t_stat)) %>% 
+      dplyr::arrange(desc(mean_t)) %>% 
+      tibble::deframe()
+    
+  } else if (ranking_metric == "sbp"){
+    
+    # ranking metric - average signed fold change * -log10(p_val)
+    ranks <- lm_results_df %>% 
+      dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+      dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+      dplyr::mutate(sign_beta_pval = sign(beta)*-log10(p_val)) %>% 
+      dplyr::group_by(external_gene_name) %>% 
+      dplyr::summarise(mean_sbp = mean(sign_beta_pval)) %>% 
+      dplyr::arrange(desc(mean_sbp)) %>% 
+      tibble::deframe()
+    
+  }
+   
+  if(gene_set == "Hallmark"){
+      # import pathway gmt files
+      # Hallmark
+      pathways.h.all.v2024 <- gmtPathways("metadata/h.all.v2024.1.Hs.symbols.gmt.txt")
+    
+      set.seed(42)
+      fgseaRes_hallmark <- fgseaMultilevel(pathways = pathways.h.all.v2024, 
+                                           stats = ranks) %>% 
+                           dplyr::arrange(pval)
+      
+      return(fgseaRes_hallmark)
+      
+  } else if(gene_set == "Everything"){
+    
+      # Everything
+      pathways.msigdb.v2024 <- gmtPathways("metadata/msigdb.v2024.1.Hs.symbols.gmt.txt")
+      
+      set.seed(43)
+      fgseaRes_msigdb <- fgseaMultilevel(pathways = pathways.msigdb.v2024, 
+                                         stats = ranks) %>% 
+                         dplyr::arrange(pval)
+    
+      return(fgseaRes_msigdb)
+      
+  }
+  
+}
+
+# Hallmark results
+results_gene_mass_gsea_tstat <- gsea_fun(lm_results_df = results_gene_mass, 
+                                             ranking_metric = "t-stat", 
+                                             gene_set = "Hallmark") 
+
+results_gene_mass_gsea_tstat %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  DT::datatable(caption = "SVM - Hallmark, CPM, t-stat ranks")
+
+# save results
+# saveRDS(results_gene_mass_gsea_tstat, "results/results_gene_mass_gsea_tstat_gseahallmark_012626.rds")
+```
+
+### GSVA
+
+Perform subject-level pathway analysis and note pathways that change dramatically for high-residual individuals.
+
+Subjects to prioritise - 
+High positive-residual individuals - 
+94495
+68089
+44288
+
+High negative-residual individuals - 
+47346
+79877
+50384
+
+```{r warning = FALSE, message = FALSE}
+# Prep data for GSVA
+# convert Ensembl IDs to gene symbols
+# where you have multiple gene symbols mapping to the same ensembl ID, keep the one with highest variance across all samples
+counts_log_cpm_gsva <- counts_log_cpm %>% 
+                    dplyr::inner_join(
+                      genes_df,
+                      join_by(ensembl_gene_id)
+                    ) %>% 
+                    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+                    dplyr::select(-ensembl_gene_id) %>% 
+                    dplyr::rowwise() %>% 
+                    dplyr::mutate(gene_var = var(c_across(where(is.numeric)), na.rm = TRUE)) %>% 
+                    dplyr::ungroup() %>% 
+                    dplyr::group_by(external_gene_name) %>% 
+                    dplyr::slice_max(gene_var) %>% 
+                    dplyr::ungroup() %>% 
+                    dplyr::select(-gene_var) %>% 
+                    tidyr::drop_na()
+
+# Note: we go from 32291 to 24867 genes when we pick the duplicate with highest variance
+
+counts_lcpm_mat <- as.matrix(counts_log_cpm_gsva[-1])
+rownames(counts_lcpm_mat) <- counts_log_cpm_gsva$external_gene_name
+
+# get gene sets
+pathways.h.all.v2024 <- gmtPathways("metadata/h.all.v2024.1.Hs.symbols.gmt.txt")
+pathways.msigdb.v2024 <- gmtPathways("metadata/msigdb.v2024.1.Hs.symbols.gmt.txt")
+
+# HALLMARK
+gsva_hallmark <- GSVA::gsvaParam(exprData = counts_lcpm_mat,
+                                 geneSets = pathways.h.all.v2024,
+                                 minSize = 5,
+                                 kcdf = "Gaussian")
+gsva_hallmark_res <- GSVA::gsva(gsva_hallmark)
+
+# inspect results
+gsva_hallmark_res_reshape <- gsva_hallmark_res %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("pathway") %>% 
+  tidyr::pivot_longer(
+    cols = -pathway,
+    names_to = "id_time",
+    values_to = "score"
+  ) %>% 
+  dplyr::mutate(id_time = str_remove(id_time, "^X")) %>% 
+  tidyr::separate_wider_delim(
+    cols = id_time,
+    names = c("deidnum", "timepoint"),
+    delim = "_"
+  ) %>% 
+  tidyr::pivot_wider(
+    names_from = timepoint,
+    values_from = score
+  ) %>% 
+  dplyr::mutate(score_delta = `12month` - Baseline)
+
+# compare extreme positive v negative residual individuals
+# positive
+gsva_hallmark_res_reshape %>% 
+  dplyr::filter(deidnum == 44288) %>% View()
+# negative
+gsva_hallmark_res_reshape %>% 
+  dplyr::filter(deidnum ==  50384) %>% View()
+
+# Heatmap of GSVA scores for extreme-residual individuals
+
+# prep heatmap mat
+heatmap_df <- gsva_hallmark_res_reshape %>% 
+  dplyr::filter(deidnum %in% c(94495, 68089, 44288, 47346, 79877, 50384)) %>% 
+  dplyr::select(pathway, deidnum, score_delta) %>% 
+  tidyr::pivot_wider(
+    names_from = deidnum,
+    values_from = score_delta
+  )
+
+heatmap_mat <- as.matrix(heatmap_df[-1])
+rownames(heatmap_mat) <- heatmap_df$pathway
+
+# make column annotation dd
+annot_col <- tibble::tibble(
+  residual = c("pos", "neg", "pos", "pos", "neg", "neg")
+) %>% 
+  data.frame()
+rownames(annot_col) <- colnames(heatmap_mat)
+
+pheatmap(heatmap_mat,
+         annotation_col = annot_col)
+
+# Correlating GSVA score deltas with residuals
+# reshape GSVA df
+gsva_cor_df <- gsva_hallmark_res_reshape %>% 
+                dplyr::select(pathway, deidnum, score_delta) %>% 
+                tidyr::pivot_wider(
+                  names_from = pathway,
+                  values_from = score_delta
+                ) %>% 
+                dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+                dplyr::arrange(deidnum)
+
+# keep same deidnum and order in residuals df
+residuals_cor_df <- residuals_strength_v_mass %>% 
+                      dplyr::filter(deidnum %in% gsva_cor_df$deidnum) %>% 
+                      dplyr::arrange(deidnum)
+
+# ensure equal deidnum order
+# identical(residuals_cor_df$deidnum, gsva_cor_df$deidnum) # TRUE
+
+# Pearson correlation coefficients
+cor(residuals_cor_df$residuals, gsva_cor_df[-1]) %>% 
+  data.frame() %>% 
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "pathway",
+    values_to = "cor_coeff"
+  ) %>% View()
+```
+
+## Top ten protein-coding genes
+
+i.e. top 5 positive and top 5 negative protein-coding genes
+
+```{r message = FALSE, warning = FALSE}
+# mart <- useEnsembl(biomart = "ensembl",
+#                    dataset = "hsapiens_gene_ensembl",
+#                    version = 114)
+
+# Get biotypes
+# gene_biotypes <- biomaRt::getBM(
+#   attributes = c("ensembl_gene_id", "gene_biotype"),
+#   filters = "ensembl_gene_id",
+#   values = unique(results_gene_mass$ensembl_gene_id),
+#   mart = mart
+# )
+
+# save this file
+# write_csv(gene_biotypes, "metadata/gene_biotypes_012626.csv")
+
+# import gene biotypes
+gene_biotypes <- read_csv("metadata/gene_biotypes_012626.csv")
+
+# Keep only protein-coding genes
+protein_coding_ids <- gene_biotypes %>%
+  dplyr::filter(gene_biotype == "protein_coding") %>%
+  dplyr::pull(ensembl_gene_id)
+
+# get top 5 positive protein-coding genes
+top_genes_cpm_protein <- results_gene_mass %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(
+    ensembl_gene_id %in% protein_coding_ids,
+    p_val < 0.01
+  ) %>%
+  dplyr::arrange(desc(t_stat)) %>%
+  dplyr::slice_head(n = 5)
+
+# get top 5 negative protein-coding genes
+bottom_genes_cpm_protein <- results_gene_mass %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(
+    ensembl_gene_id %in% protein_coding_ids,
+    p_val < 0.01
+  ) %>%
+  dplyr::arrange(t_stat) %>%
+  dplyr::slice_head(n = 5)
+
+# combine positive and negative PC genes into one table
+top10_genes_cpm_protein <- dplyr::bind_rows(
+  top_genes_cpm_protein, bottom_genes_cpm_protein) %>%
+  dplyr::left_join(genes_df, 
+                   join_by(ensembl_gene_id)) %>%
+  dplyr::relocate(external_gene_name, .after = ensembl_gene_id)
+
+# save this
+# write_csv(top10_genes_cpm_protein, "results/top10_genes_cpm_protein_NM_012626.csv")
+
+# This is the file NM used for her STRING analysis
+```
+
+## Some values reported in the paper
+
+```{r message = FALSE, warning = FALSE}
+# total number of starting genes
+nrow(counts) # 60,605
+
+# total number of filtered genes
+nrow(counts_log_cpm) # 32,291
+
+# total number of filtered genes with corresponding gene symbols
+nrow(results_gene_mass) # 25,200
+```
+
+## Figures and tables for manuscript
+
+```{r message = FALSE, warning = FALSE}
+# import data and results
+df <- read_csv("results/df_for_lm_AB_012626.csv")
+SUBJECT1 <- read_csv("Regression Analysis Data/data/SUBJECT1.CSV") %>%  # to get age
+  dplyr::select(deidnum, age)
+CLWTVIS <- read_csv("Regression Analysis Data/data/CLWTVIS.CSV") %>%  # to get BMI (in `mbmi` column)
+  dplyr::filter(visit %in% c("Baseline", "Month 12")) %>%
+  dplyr::select(deidnum, visit, mbmi) %>% 
+  tidyr::pivot_wider(
+    names_from = visit,
+    values_from = mbmi
+  )
+counts_log_cpm <- read_csv("results/counts_log_cpm_AB_012626.csv")
+results_gene_mass <- read_csv("results/results_gene_mass_AB_012626.csv")
+genes_df <- read_csv("metadata/genes_df_081925.csv")
+results_gene_mass_gsea_tstat <- readRDS("results/results_gene_mass_gsea_tstat_gseahallmark_012626.rds")
+top10_genes_cpm_protein <- read_csv("results/top10_genes_cpm_protein_NM_012626.csv")
+
+# Table 1
+## Strength vs. Whole-Body Mass Cohort (N = 198)
+df %>% 
+  dplyr::inner_join(
+    SUBJECT1,
+    join_by(deidnum)
+  ) %>% 
+  dplyr::inner_join(
+    CLWTVIS,
+    join_by(deidnum)
+  ) %>% 
+  dplyr::summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    mean_bmi_base = mean(Baseline, na.rm = TRUE),
+    sd_bmi_base = sd(Baseline, na.rm = TRUE),
+    mean_bmi_12m = mean(`Month 12`, na.rm = TRUE),
+    sd_bmi_12m = sd(`Month 12`, na.rm = TRUE),
+    mean_perc_strength_change = mean(`% Strength`),
+    sd_perc_strength_change = sd(`% Strength`),
+    mean_perc_wbm_change = mean(`% Mass`),
+    sd_perc_wbm_change = sd(`% Mass`)
+  ) %>% View()
+
+df %>% 
+  dplyr::count(sex) %>% 
+  dplyr::mutate(perc = 100 * n/sum(n) )
+  
+## Residuals vs. Gene Transcripts Cohort (N = 42)
+transcript_deidnums <- as.numeric(unique(str_extract(colnames(counts_log_cpm)[-1], ".+(?=\\_)")))
+                        
+df %>% 
+  dplyr::inner_join(
+    SUBJECT1,
+    join_by(deidnum)
+  ) %>% 
+  dplyr::inner_join(
+    CLWTVIS,
+    join_by(deidnum)
+  ) %>% 
+  dplyr::filter(deidnum %in% transcript_deidnums) %>% 
+  dplyr::summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    mean_bmi_base = mean(Baseline, na.rm = TRUE),
+    sd_bmi_base = sd(Baseline, na.rm = TRUE),
+    mean_bmi_12m = mean(`Month 12`, na.rm = TRUE),
+    sd_bmi_12m = sd(`Month 12`, na.rm = TRUE),
+    mean_perc_strength_change = mean(`% Strength`),
+    sd_perc_strength_change = sd(`% Strength`),
+    mean_perc_wbm_change = mean(`% Mass`),
+    sd_perc_wbm_change = sd(`% Mass`)
+  ) %>% View()
+ 
+df %>% 
+  dplyr::filter(deidnum %in% transcript_deidnums) %>%
+  dplyr::count(sex) %>% 
+  dplyr::mutate(perc = 100 * n/sum(n) ) 
+
+# Table 2
+table_2 <- results_gene_mass %>% 
+  dplyr::slice_min(p_val, n = 10) %>% 
+  dplyr::inner_join(
+    genes_df,
+    join_by(ensembl_gene_id)
+  ) %>% 
+  dplyr::relocate(external_gene_name) %>% 
+  dplyr::select(-c(ensembl_gene_id, BH_p_val)) %>% 
+  dplyr::rename(
+    `Gene Name` = external_gene_name,
+    Beta = beta,
+    `Standard Error` = std_error,
+    `t-statistic` = t_stat,
+    `p-value` = p_val
+  ) %>% 
+  dplyr::mutate(across(.cols = -c(`Gene Name`, `p-value`),
+                       .fns = ~round(.x, 2)))
+# save table 2
+# write.xlsx(table_2, "results/table_2_AB_012626.xlsx")
+
+# Table 3
+# top 5 positive and negative NES pathways
+table_3 <- results_gene_mass_gsea_tstat %>% 
+  dplyr::group_by(NES > 0) %>% 
+  dplyr::slice_min(pval, n = 5) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::select(-leadingEdge) %>%
+  dplyr::mutate(across(.cols = -c(pathway:padj),
+                       .fns = ~round(.x, 2))) %>% 
+  dplyr::mutate(
+    pathway = str_remove(pathway, "HALLMARK_"),
+    pathway = str_replace_all(pathway, "_", " ")
+  ) %>% 
+  dplyr::rename(
+    `Hallmark Pathway` = pathway,
+    `p-value` = pval,
+    `Adjusted p-value` = padj,
+    `Log2 Error` = log2err,
+    Size = size
+  ) %>% 
+  dplyr::select(`Hallmark Pathway`:Size) 
+# save table 3
+# write.xlsx(table_3, "results/table_3_AB_012626.xlsx")
+
+# Table 4
+table_4 <- top10_genes_cpm_protein %>% 
+  dplyr::select(external_gene_name:p_val) %>% 
+  dplyr::mutate(across(.cols = beta:t_stat,
+                       .fns = ~ round(.x, 2))) %>% 
+  dplyr::rename(
+    `Gene Name` = external_gene_name,
+    Beta = beta,
+    `Standard Error` = std_error,
+    `t-statistic` = t_stat,
+    `p-value` = p_val
+  )
+# save table 4
+# write.xlsx(table_4, "results/table_4_AB_012626.xlsx")
+
+# Figure 1
+# "results/figures/figure_1_flowchart_for_CALERIE.001.jpegg"
+# Made by AB
+
+# Figure 2
+figure_2 <- df %>% 
+  dplyr::mutate(
+    group_omics = if_else(
+      deidnum %in% transcript_deidnums,
+      "Has transcriptomics data",
+      "Does not have transcriptomics data"
+    )
+  ) %>% 
+  ggplot(aes(`% Mass`, `% Strength`)) +
+  geom_point(aes(col = group_omics)) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              linetype = "dashed",
+              col = "black") +
+  geom_vline(xintercept = 0,
+             linetype = "dotted") +
+  geom_hline(yintercept = 0,
+             linetype = "dotted") +
+  theme_bw() +
+  labs(x = "% Change in Whole-Body Mass",
+       y = "% Change in Strength") +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom") +
+  stat_poly_eq(aes(label = after_stat(rr.label)), formula = y ~ x, parse = TRUE)
+
+# save Figure 2
+# ggsave("results/figures/figure_2_AB_012626.tiff", figure_2)
+
+# Figure 3
+figure_3 <- residuals_strength_v_mass %>% 
+  ggplot(aes(residuals)) +
+  geom_histogram(aes(y = after_stat(count)),
+                 col = "black",
+                 fill = "lightblue") +
+  geom_vline(xintercept = mean(residuals_strength_v_mass$residuals),
+             linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Residual Value",
+       y = "Count")
+# save Figure 3
+# ggsave("results/figures/figure_3_AB_012626.tiff", figure_3)
+
+# Figure 4
+figure_4 <- table_3 %>% 
+  dplyr::mutate(direction = if_else(NES > 0,
+                                    "Upregulated", "Downregulated"),
+                direction = fct_relevel(direction,
+                                        "Upregulated")) %>% 
+  ggplot(aes(NES, fct_reorder(`Hallmark Pathway`, NES),
+             fill = direction)) +
+  geom_col() +
+  theme_bw() +
+  scale_fill_manual(values = c("darkgreen", "darkred")) +
+  labs(x = "Normalized Enriched Score (NES)",
+       y = "") +
+  theme(legend.title = element_blank())
+# save Figure 4
+# ggsave("results/figures/figure_4_AB_012626.tiff", figure_4)
+
+# Figure 5
+# "results/figures/string_result_1_21_26.png"
+```
+
+## Additional analyses
+
+### Adding sex as a covariate
+
+```{r message = FALSE, warning = FALSE}
+# fit gene expression linear models
+# specify model formula
+formula_sex <- reformulate(c("delta_norm_counts", "`% Mass`", "sex"), response = "`% Strength`")
+
+results_gene_mass_sex <- fit_lm_counts_multi(strength_data = df,
+                                             counts_df = counts_log_cpm,
+                                             model_formula = formula_sex)
+
+# present results
+results_gene_mass_sex %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % Mass + sex")
+
+# number of results with p < 0.01
+results_gene_mass_sex %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 143
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass_sex %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_mass_sex,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_mass_sex")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_mass_sex)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs % Mass + sex")
+```
+
+### % strength change ~ % FFM change
+
+```{r message = FALSE, warning = FALSE}
+ffm_data <- read_csv("Regression Analysis Data/data/DXAA.CSV") %>% 
+              dplyr::select(deidnum, visit, BTOTFFM) %>% 
+              dplyr::mutate(across(where(is.character), ~ str_trim(tolower(.)))) %>% 
+              dplyr::mutate(BTOTFFM = as.numeric(BTOTFFM)) %>% 
+              dplyr::filter(visit %in% c("bl sub 2", "month 12")) %>% 
+              tidyr::pivot_wider(
+                names_from = "visit",
+                values_from = "BTOTFFM"
+              ) %>% 
+              tidyr::drop_na() %>% 
+              dplyr::rename(
+                ffm_baseline = `bl sub 2`,
+                ffm_12m = `month 12`
+              ) %>% 
+              dplyr::mutate(
+                  `∆ FFM` = ffm_12m - ffm_baseline,
+                  `% FFM` = (`∆ FFM` / ffm_baseline) * 100
+                )
+
+# join with main df
+df_with_ffm <- df %>% 
+                dplyr::left_join(
+                  ffm_data,
+                  join_by(deidnum)
+                )
+
+# Run regression
+strength_v_ffm_lm <- lm(`% Strength` ~ `% FFM`, data = df_with_ffm)
+summary(strength_v_ffm_lm) # much higher coefficient compared to % Mass model
+
+# fit gene expression linear models
+# specify model formula
+formula_ffm <- reformulate(c("delta_norm_counts", "`% FFM`"), response = "`% Strength`")
+
+results_gene_ffm <- fit_lm_counts_multi(strength_data = df_with_ffm,
+                                         counts_df = counts_log_cpm,
+                                         model_formula = formula_ffm)
+
+# present results
+results_gene_ffm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % FFM")
+
+# number of results with p < 0.01
+results_gene_ffm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 169
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_ffm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+mass_v_ffm_fig <- results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_ffm,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_ffm")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_ffm)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs % FFM")
+```
+
+### % strength change ~ % LSTM change
+
+lean soft-tissue mass = BTOTFFM - BTOTBMC
+
+```{r message = FALSE, warning = FALSE}
+bmc_data <- read_csv("Regression Analysis Data/data/DXAA.CSV") %>% 
+              dplyr::select(deidnum, visit, BTOTBMC) %>% 
+              dplyr::mutate(across(where(is.character), ~ str_trim(tolower(.)))) %>% 
+              dplyr::mutate(BTOTBMC = as.numeric(BTOTBMC)) %>% 
+              dplyr::filter(visit %in% c("bl sub 2", "month 12")) %>% 
+              tidyr::pivot_wider(
+                names_from = "visit",
+                values_from = "BTOTBMC"
+              ) %>% 
+              tidyr::drop_na() %>% 
+              dplyr::rename(
+                bmc_baseline = `bl sub 2`,
+                bmc_12m = `month 12`
+              )
+
+# join with df_with_ffm and compute lstm changes
+df_with_lstm <- df_with_ffm %>% 
+  dplyr::left_join(
+    bmc_data,
+    join_by(deidnum)
+  ) %>% 
+  dplyr::mutate(
+    `∆ LSTM` = (ffm_12m - bmc_12m) - (ffm_baseline - bmc_baseline),
+    `% LSTM` = (`∆ LSTM` / (ffm_baseline - bmc_baseline)) * 100
+  ) 
+
+# Run regression
+strength_v_lstm_lm <- lm(`% Strength` ~ `% LSTM`, data = df_with_lstm)
+summary(strength_v_lstm_lm) # much higher coefficient compared to % Mass model
+
+# fit gene expression linear models
+# specify model formula
+formula_lstm <- reformulate(c("delta_norm_counts", "`% LSTM`"), response = "`% Strength`")
+
+results_gene_lstm <- fit_lm_counts_multi(strength_data = df_with_lstm,
+                                         counts_df = counts_log_cpm,
+                                         model_formula = formula_lstm)
+
+# present results
+results_gene_lstm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % LSTM")
+
+# number of results with p < 0.01
+results_gene_lstm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 165
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_lstm %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+mass_vs_lstm_fig <- results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_lstm,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_lstm")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_lstm)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs % LSTM")
+```
+
+**Conclusion:** All of the above results are very similar to those of the model presented in the paper. 
+
+### Looking only at individuals who lost mass
+
+```{r}
+df_mass_loss <- df %>% 
+                  dplyr::filter(`% Mass` < 0)
+nrow(df_mass_loss) # 156
+
+# how many of these individuals also have transcriptomics data?
+counts_log_cpm %>% 
+    dplyr::filter(ensembl_gene_id == "ENSG00000155657") %>%
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(df_mass_loss, join_by(deidnum)) %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% # only keep gene IDs with corresponding gene symbols
+    dplyr::filter(external_gene_name != "") %>% 
+    nrow() 
+# 33
+
+# we lost 9 individuals
+
+# fit gene expression linear models
+# specify model formula
+formula_mass <- reformulate(c("delta_norm_counts", "`% Mass`"), response = "`% Strength`")
+
+results_gene_mass_loss <- fit_lm_counts_multi(strength_data = df_mass_loss,
+                                         counts_df = counts_log_cpm,
+                                         model_formula = formula_mass)
+
+# present results
+results_gene_mass_loss %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % Mass")
+
+# number of results with p < 0.01
+results_gene_mass_loss %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 77
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass_loss %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+all_vs_mass_loss_fig <- results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_mass_loss,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_mass_loss")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_mass_loss)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for Full vs Only Mass Loss")
+```
+
+Pretty decent agreement
+
+### Adjusting for baseline strength
+
+```{r message = FALSE, warning = FALSE}
+# fit gene expression linear models
+# specify model formula
+formula_base <- reformulate(c("delta_norm_counts", "`% Mass`", "strength_baseline"), response = "`% Strength`")
+
+results_gene_mass_base <- fit_lm_counts_multi(strength_data = df,
+                                             counts_df = counts_log_cpm,
+                                             model_formula = formula_base)
+
+# present results
+results_gene_mass_base %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "% Strength ~ delta_norm_counts results (CPM) + % Mass + strength_baseline")
+
+# number of results with p < 0.01
+results_gene_mass_base %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 140
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass_base %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+mass_vs_baseline_fig <- results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_mass_base,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_mass_base")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_mass_base)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs % Mass + strength_baseline")
+```
+
+Good agreement.  
+
+### ANCOVA-style model
+
+Fitting the following model - 
+
+strength_12m ~ `12month` + strength_baseline + mass_baseline + mass_12m + Baseline
+
+Where - 
+`12month` = logCPM at 12 month
+Baseline = logCPM at baseline
+
+Note - it's critical that the **first** term in the model formula above be the 12-month logCPM value!!
+
+```{r warning = FALSE, message = FALSE}
+# fit gene expression linear models
+# specify model formula
+formula_ancova <- reformulate(c("`12month`", "strength_baseline", "mass_baseline", "mass_12m", "Baseline"), response = "strength_12m")
+
+results_gene_mass_ancova <- fit_lm_counts_multi(strength_data = df,
+                                                counts_df = counts_log_cpm,
+                                                model_formula = formula_ancova)
+
+# present results
+results_gene_mass_ancova %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "ANCOVA model")
+
+# number of results with p < 0.01
+results_gene_mass_ancova %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 106
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass_ancova %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_mass_ancova,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_mass_ancova")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_mass_ancova)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs ANCOVA model")
+# ok agreement
+```
+
+#### Comparing first model with ANCOVA-style model for a few top genes
+
+```{r message = FALSE, warning = FALSE}
+# genes to test
+# top most significant genes for first model
+# ENSG00000080824 (HSP90AA1)
+# ENSG00000158417 (EIF5B)
+# ENSG00000211459 (MT-RNR1)
+# ENSG00000226803 (ZNF451-AS1)
+# ENSG00000210082 (MT-RNR2)
+
+# top most significant genes for ANCOVA-style model
+# ENSG00000251298 (TMEM184C-DT)
+# ENSG00000268758 (ADGRE4P)
+# ENSG00000234336 (JAZF1-AS1)
+# ENSG00000276404 (MIR6835)
+# ENSG00000115461 (IGFBP5)
+
+# test on one gene
+test_df <- counts_log_cpm %>% 
+    dplyr::filter(ensembl_gene_id == "ENSG00000080824") %>% 
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(df, join_by(deidnum)) %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% # only keep gene IDs with corresponding gene symbols
+    dplyr::filter(external_gene_name != "") 
+
+# apply(test_df, 2, function(x) sum(is.na(x)))
+# no missing values
+
+test_lm <- lm(`% Strength` ~ delta_norm_counts + `% Mass`, data = test_df)
+summary(test_lm)
+
+test_lm_delta <- lm(`∆ Strength` ~ delta_norm_counts + `∆ Mass`, data = test_df)
+summary(test_lm_delta)
+
+# alternatively
+test_lm_ancova <- lm(strength_12m ~ `12month` + strength_baseline + mass_12m + mass_baseline + Baseline, data = test_df)
+summary(test_lm_ancova)
+
+plot(test_lm)
+plot(test_lm_delta)
+plot(test_lm_ancova)
+
+# remove deidnum and re-assess
+test_df_no_94495 <- test_df %>% 
+                      dplyr::filter(deidnum != "94495")
+test_lm_no_94495 <- lm(`% Strength` ~ delta_norm_counts + `% Mass`, data = test_df_no_94495)
+test_lm_ancova_no_94495 <- lm(strength_12m ~ `12month` + strength_baseline + mass_12m + mass_baseline + Baseline, data = test_df_no_94495)
+
+summary(test_lm_no_94495)
+summary(test_lm_ancova_no_94495)
+
+plot(test_lm_no_94495)
+plot(test_lm_ancova_no_94495)
+
+# removing this individual improves the plots a bit
+```
+
+Notes - 
+
+The ANCOVA-style model produces better diagnostic plots, **especially** for ENSG00000080824 (HSP90AA1)!!
+
+**Note:** deidnum 94495 looks like an influential point in a number of analyses. For example, after removing this individual, ENSG00000211459 goes from being "highly significant" to not significant at all!
+
+**Decision: **
+- Repeat ANCOVA-style model AFTER removing deidnum 94495
+
+### ANCOVA-style model WITHOUT deidnum 94495
+
+```{r message = FALSE, warning = FALSE}
+# filter counts df
+counts_df_no_94495 <- counts_log_cpm %>% 
+                        dplyr::select(!contains("94495"))
+
+# fit gene expression linear models
+# specify model formula
+formula_ancova <- reformulate(c("`12month`", "strength_baseline", "mass_baseline", "mass_12m", "Baseline"), response = "strength_12m")
+
+results_gene_mass_ancova_no_94495 <- fit_lm_counts_multi(strength_data = df,
+                                                counts_df = counts_df_no_94495,
+                                                model_formula = formula_ancova)
+
+# present results
+results_gene_mass_ancova_no_94495 %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::arrange(p_val) %>% 
+    dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>% 
+    DT::datatable(caption = "ANCOVA model (no 94495)")
+
+# number of results with p < 0.01
+results_gene_mass_ancova_no_94495 %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>% 
+    dplyr::filter(p_val < 0.01)
+# 106
+
+# N highest positive t-stats and highest negative t-stats
+results_gene_mass_ancova_no_94495 %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% 
+    dplyr::relocate(external_gene_name, .after = ensembl_gene_id) %>%
+  dplyr::group_by(t_stat > 0) %>% 
+  dplyr::slice_max(abs(t_stat), n = 5)
+
+# compare with % Mass data
+results_gene_mass %>% 
+  dplyr::inner_join(
+    results_gene_mass_ancova_no_94495,
+    join_by(ensembl_gene_id),
+    suffix = c("_mass", "_mass_ancova")
+  ) %>% 
+  ggplot(aes(beta_mass, beta_mass_ancova)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for % Mass vs ANCOVA model")
+# ok agreement
+
+# compare with ANCOVA-style model using full data
+results_gene_mass_ancova %>% 
+  dplyr::inner_join(
+    results_gene_mass_ancova_no_94495,
+    join_by(ensembl_gene_id),
+    suffix = c("_ancova", "_ancova_no_94495")
+  ) %>% 
+  ggplot(aes(beta_ancova, beta_ancova_no_94495)) +
+  geom_point() +
+  geom_abline(linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Beta estimates for ANCOVA models")
+# again, ok agreement
+```
+
+#### GSEA
+
+```{r warning = FALSE, message = FALSE}
+# gmt files downloaded from -
+# https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/
+
+# Hallmark results
+results_gene_ancova_gsea_tstat <- gsea_fun(lm_results_df = results_gene_mass_ancova_no_94495, 
+                                             ranking_metric = "t-stat", 
+                                             gene_set = "Hallmark") 
+
+results_gene_ancova_gsea_tstat %>% 
+  dplyr::mutate(across(where(is.numeric), ~round(.x, 3))) %>%
+  DT::datatable(caption = "ANCOVA - Hallmark, CPM, t-stat ranks")
+
+```
+
+### Added variables plot for HSP90AA1
+
+ENSG00000080824
+
+```{r message = FALSE, warning = FALSE}
+# test on one gene
+hsp90aa1_df <- counts_log_cpm %>% 
+    dplyr::filter(ensembl_gene_id == "ENSG00000080824") %>%
+    tidyr::pivot_longer(cols = -ensembl_gene_id,
+                        names_to = "sample",
+                        values_to = "norm_count") %>% 
+    tidyr::separate_wider_delim(sample, delim = "_", names = c("deidnum", "timepoint")) %>% 
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = norm_count
+    ) %>% 
+    dplyr::mutate(delta_norm_counts = `12month` - Baseline) %>% 
+    dplyr::mutate(deidnum = as.numeric(deidnum)) %>% 
+    dplyr::inner_join(df, join_by(deidnum)) %>% 
+    dplyr::inner_join(genes_df, join_by(ensembl_gene_id)) %>% # only keep gene IDs with corresponding gene symbols
+    dplyr::filter(external_gene_name != "") 
+
+hsp90aa1_lm <- lm(`% Strength` ~ delta_norm_counts + `% Mass`, data = hsp90aa1_df)
+summary(hsp90aa1_lm)
+
+avplot_data <- car::avPlot(model = hsp90aa1_lm,
+                      variable = "delta_norm_counts")
+
+avplot_data %>% 
+  ggplot(aes(delta_norm_counts, `% Strength`)) +
+  geom_point() +
+  geom_smooth(method = "lm",
+              se = FALSE) +
+  theme_bw() +
+  labs(title = "Added Variable Plot for delta HSP90AA1 counts",
+       x = "Residuals of delta HSP90AA1 counts regressed on % Mass",
+       y = "Residuals of % Strength regressed on % Mass")
+```
+
+## Supplementary Figures and tables
+
+```{r}
+supp_fig_1 <- (mass_v_ffm_fig / mass_vs_lstm_fig / all_vs_mass_loss_fig / mass_vs_baseline_fig) +
+                  plot_annotation(tag_level = "A")
+
+# save Supplementary Figure 1
+ggsave("results/figures/supp_figure_1_AB_033126.tiff",
+       supp_fig_1,
+       height = 9)
+```
+
+
+## Session Info
+
+```{r}
+utils::sessionInfo()
+
+# R version 4.5.0 (2025-04-11)
+# Platform: aarch64-apple-darwin20
+# Running under: macOS Sonoma 14.4
+# 
+# Matrix products: default
+# BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+# LAPACK: /Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.1
+# 
+# locale:
+# [1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+# 
+# time zone: America/New_York
+# tzcode source: internal
+# 
+# attached base packages:
+# [1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+# 
+# other attached packages:
+#  [1] car_3.1-3              carData_3.0-5          ggpmisc_0.6.2          ggpp_0.5.9             openxlsx_4.2.8.1      
+#  [6] org.Hs.eg.db_3.21.0    AnnotationDbi_1.70.0   IRanges_2.42.0         S4Vectors_0.46.0       Biobase_2.68.0        
+# [11] BiocGenerics_0.54.1    generics_0.1.4         clusterProfiler_4.16.0 pathview_1.48.0        pheatmap_1.0.13       
+# [16] GSVA_2.2.1             patchwork_1.3.2        fgsea_1.34.2           DT_0.34.0              edgeR_4.6.3           
+# [21] limma_3.64.3           biomaRt_2.64.0         ggfortify_0.4.19       lubridate_1.9.4        forcats_1.0.1         
+# [26] stringr_1.6.0          dplyr_1.1.4            purrr_1.2.0            readr_2.1.6            tidyr_1.3.1           
+# [31] tibble_3.3.0           ggplot2_4.0.1          tidyverse_2.0.0       
+# 
+# loaded via a namespace (and not attached):
+#   [1] splines_4.5.0               bitops_1.0-9                ggplotify_0.1.3             filelock_1.0.3             
+#   [5] R.oo_1.27.1                 graph_1.86.0                XML_3.99-0.20               lifecycle_1.0.4            
+#   [9] httr2_1.2.1                 vroom_1.6.6                 MASS_7.3-65                 lattice_0.22-7             
+#  [13] crosstalk_1.2.2             magrittr_2.0.4              sass_0.4.10                 rmarkdown_2.30             
+#  [17] jquerylib_0.1.4             yaml_2.3.10                 ggtangle_0.0.8              zip_2.3.3                  
+#  [21] cowplot_1.2.0               DBI_1.2.3                   RColorBrewer_1.1-3          abind_1.4-8                
+#  [25] GenomicRanges_1.60.0        R.utils_2.13.0              RCurl_1.98-1.17             yulab.utils_0.2.1          
+#  [29] rappdirs_0.3.3              GenomeInfoDbData_1.2.14     enrichplot_1.28.4           ggrepel_0.9.6              
+#  [33] irlba_2.3.5.1               tidytree_0.4.6              MatrixModels_0.5-4          annotate_1.86.1            
+#  [37] codetools_0.2-20            DelayedArray_0.34.1         DOSE_4.2.0                  xml2_1.5.0                 
+#  [41] tidyselect_1.2.1            aplot_0.2.9                 UCSC.utils_1.4.0            farver_2.1.2               
+#  [45] ScaledMatrix_1.16.0         matrixStats_1.5.0           BiocFileCache_2.16.2        jsonlite_2.0.0             
+#  [49] Formula_1.2-5               survival_3.8-3              tools_4.5.0                 progress_1.2.3             
+#  [53] treeio_1.32.0               Rcpp_1.1.0                  glue_1.8.0                  gridExtra_2.3              
+#  [57] SparseArray_1.8.1           xfun_0.54                   qvalue_2.40.0               MatrixGenerics_1.20.0      
+#  [61] GenomeInfoDb_1.44.3         HDF5Array_1.36.0            withr_3.0.2                 fastmap_1.2.0              
+#  [65] rhdf5filters_1.20.0         SparseM_1.84-2              digest_0.6.39               rsvd_1.0.5                 
+#  [69] timechange_0.3.0            R6_2.6.1                    gridGraphics_0.5-1          colorspace_2.1-2           
+#  [73] GO.db_3.21.0                dichromat_2.0-0.1           RSQLite_2.4.4               R.methodsS3_1.8.2          
+#  [77] h5mread_1.0.1               utf8_1.2.6                  data.table_1.17.8           prettyunits_1.2.0          
+#  [81] httr_1.4.7                  htmlwidgets_1.6.4           S4Arrays_1.8.1              pkgconfig_2.0.3            
+#  [85] gtable_0.3.6                rsconnect_1.6.2             blob_1.2.4                  S7_0.2.1                   
+#  [89] SingleCellExperiment_1.30.1 XVector_0.48.0              htmltools_0.5.8.1           GSEABase_1.70.1            
+#  [93] scales_1.4.0                png_0.1-8                   SpatialExperiment_1.18.1    ggfun_0.2.0                
+#  [97] knitr_1.50                  rstudioapi_0.17.1           tzdb_0.5.0                  reshape2_1.4.5             
+# [101] rjson_0.2.23                nlme_3.1-168                curl_7.0.0                  cachem_1.1.0               
+# [105] rhdf5_2.52.1                parallel_4.5.0              pillar_1.11.1               grid_4.5.0                 
+# [109] vctrs_0.6.5                 BiocSingular_1.24.0         dbplyr_2.5.1                beachmat_2.24.0            
+# [113] xtable_1.8-4                Rgraphviz_2.52.0            evaluate_1.0.5              KEGGgraph_1.68.0           
+# [117] magick_2.9.0                cli_3.6.5                   locfit_1.5-9.12             compiler_4.5.0             
+# [121] rlang_1.1.6                 crayon_1.5.3                labeling_0.4.3              plyr_1.8.9                 
+# [125] fs_1.6.6                    stringi_1.8.7               BiocParallel_1.42.2         Biostrings_2.76.0          
+# [129] lazyeval_0.2.2              quantreg_6.1                GOSemSim_2.34.0             Matrix_1.7-4               
+# [133] hms_1.1.4                   sparseMatrixStats_1.20.0    bit64_4.6.0-1               Rhdf5lib_1.30.0            
+# [137] KEGGREST_1.48.1             statmod_1.5.1               SummarizedExperiment_1.38.1 igraph_2.2.1               
+# [141] memoise_2.0.1               bslib_0.9.0                 ggtree_3.16.3               fastmatch_1.1-6            
+# [145] bit_4.6.0                   polynom_1.4-1               gson_0.1.0                  ape_5.8-1   
+```
+
