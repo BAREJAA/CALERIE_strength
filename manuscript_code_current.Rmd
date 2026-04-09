@@ -745,29 +745,8 @@ df %>%
   dplyr::mutate(perc = 100 * n/sum(n) ) 
 
 # Table 2
-table_2 <- results_gene_mass %>% 
-  dplyr::slice_min(p_val, n = 10) %>% 
-  dplyr::inner_join(
-    genes_df,
-    join_by(ensembl_gene_id)
-  ) %>% 
-  dplyr::relocate(external_gene_name) %>% 
-  dplyr::select(-c(ensembl_gene_id, BH_p_val)) %>% 
-  dplyr::rename(
-    `Gene Name` = external_gene_name,
-    Beta = beta,
-    `Standard Error` = std_error,
-    `t-statistic` = t_stat,
-    `p-value` = p_val
-  ) %>% 
-  dplyr::mutate(across(.cols = -c(`Gene Name`, `p-value`),
-                       .fns = ~round(.x, 2)))
-# save table 2
-# write.xlsx(table_2, "results/table_2_AB_012626.xlsx")
-
-# Table 3
 # top 5 positive and negative NES pathways
-table_3 <- results_gene_mass_gsea_tstat %>% 
+table_2 <- results_gene_mass_gsea_tstat %>% 
   dplyr::group_by(NES > 0) %>% 
   dplyr::slice_min(pval, n = 5) %>% 
   dplyr::ungroup() %>% 
@@ -786,11 +765,11 @@ table_3 <- results_gene_mass_gsea_tstat %>%
     Size = size
   ) %>% 
   dplyr::select(`Hallmark Pathway`:Size) 
-# save table 3
-# write.xlsx(table_3, "results/table_3_AB_012626.xlsx")
+# save table 2
+# write.xlsx(table_2, "results/table_2_AB_012626.xlsx")
 
-# Table 4
-table_4 <- top10_genes_cpm_protein %>% 
+# Table 3
+table_3 <- top10_genes_cpm_protein %>% 
   dplyr::select(external_gene_name:p_val) %>% 
   dplyr::mutate(across(.cols = beta:t_stat,
                        .fns = ~ round(.x, 2))) %>% 
@@ -801,8 +780,8 @@ table_4 <- top10_genes_cpm_protein %>%
     `t-statistic` = t_stat,
     `p-value` = p_val
   )
-# save table 4
-# write.xlsx(table_4, "results/table_4_AB_012626.xlsx")
+# save table 3
+# write.xlsx(table_3, "results/table_3_AB_012626.xlsx")
 
 # Figure 1
 # "results/figures/figure_1_flowchart_for_CALERIE.001.jpegg"
